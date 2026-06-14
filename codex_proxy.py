@@ -20,7 +20,7 @@ BASE_URL = "https://token.sensenova.cn/v1"
 
 # 服务配置
 HOST = "127.0.0.1"
-PORT = 5000
+PORT = 6000
 THREADS = 4
 DEBUG = False  # 设为 True 开启调试日志
 
