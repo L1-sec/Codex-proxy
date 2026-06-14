@@ -1,0 +1,17 @@
+model = "deepseek-v4-flash"
+model_provider = "api"
+
+[projects.'c:\users\user\desktop\codex']
+trust_level = "trusted"
+
+[tui.model_availability_nux]
+"gpt-5.5" = 3
+
+[windows]
+sandbox = "unelevated"
+
+[model_providers.api]
+name = "Proxy"
+base_url = "http://127.0.0.1:6000/v1"
+wire_api = "responses"
+requires_openai_auth = false
