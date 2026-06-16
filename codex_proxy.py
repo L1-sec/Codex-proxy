@@ -2,39 +2,69 @@ import sys
 import os
 import json
 import uuid
+import queue
 import logging
+import threading
+import time
+import traceback
 from datetime import datetime
 
+import httpx
 from flask import Flask, request, Response
 from openai import OpenAI
 
 # ===================== 配置（直接修改此处） =====================
 # API 配置
-API_KEY = "sk-**************************"  # 替换为API Key
+API_KEY = "sk-********************************************"  # 替换为API Key
 MODEL = "deepseek-v4-flash"  # 默认模型
 BASE_URL = "https://token.sensenova.cn/v1"
 
-#API_KEY = "nvapi-*********************************************************"  # 替换为API Key
+#API_KEY = "nvapi-*************************************"  # 替换为API Key
 #MODEL = "mistralai/mistral-nemotron"  # 默认模型
 #BASE_URL = "https://integrate.api.nvidia.com/v1"
 
 # 服务配置
 HOST = "127.0.0.1"
 PORT = 6000
-THREADS = 4
+THREADS = 12
 DEBUG = False  # 设为 True 开启调试日志
 
 # ===================== 日志配置 =====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEBUG_LOG = os.path.join(BASE_DIR, "proxy_debug.log")
 
-logging.basicConfig(
-    level=logging.DEBUG if DEBUG else logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+
+class _Fmt(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        return f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(record.created))},{int(record.msecs):03d}"
+
+_fmt = _Fmt('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+_h = logging.StreamHandler()
+_h.setFormatter(_fmt)
+logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO, handlers=[_h], force=True)
+
 logger = logging.getLogger('proxy')
 
 app = Flask(__name__)
+
+_client = OpenAI(
+    base_url=BASE_URL,
+    api_key=API_KEY,
+    timeout=httpx.Timeout(600.0, connect=30.0, read=600.0),
+)
+
+
+@app.before_request
+def _log_req():
+    if request.method == 'POST':
+        logger.info(f"\u2192 {request.path}")
+
+
+@app.after_request
+def _log_res(response):
+    if request.method == 'POST':
+        logger.info(f"\u2190 {response.status_code}")
+    return response
 
 
 # ===================== 工具函数 =====================
@@ -100,7 +130,7 @@ def _log_debug(messages, tools=None):
             if tools:
                 f.write(f"Tools count: {len(tools)}\n")
     except Exception as e:
-        logger.error(f"写入调试日志失败: {e}")
+        logger.exception(f"写入调试日志失败")
 
 
 # ===================== 消息提取 =====================
@@ -271,188 +301,243 @@ def _make_response():
     _log_debug(messages, tools)
 
     def generate():
-        if not messages:
-            yield _format_sse("response.completed", {
-                "type": "response.completed",
-                "response": {
-                    "id": response_id, "object": "response",
-                    "status": "completed", "model": effective_model,
-                    "output": [], "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-                },
-            })
-            return
+        # ========== 基于线程的流式处理（支持上游卡住时发心跳） ==========
+        KEEPALIVE_INTERVAL = 8  # 秒
 
-        # 发送开始事件
-        yield _format_sse("response.created", {
-            "type": "response.created",
-            "response": {
-                "id": response_id, "object": "response",
-                "status": "in_progress", "model": effective_model,
-                "output": [], "usage": None,
-            },
-        })
+        chunk_queue = queue.Queue(maxsize=500)
+        stop_event = threading.Event()
 
-        yield _format_sse("response.in_progress", {
-            "type": "response.in_progress",
-            "response": {
-                "id": response_id, "object": "response",
-                "status": "in_progress", "model": effective_model,
-                "output": [], "usage": None,
-            },
-        })
+        # ---- 上游数据拉取线程 ----
+        def upstream_worker():
+            try:
+                kwargs = {
+                    "model": effective_model,
+                    "messages": messages,
+                    "stream": True,
+                }
+                if tools:
+                    kwargs["tools"] = tools
+                    if tool_choice != "auto":
+                        kwargs["tool_choice"] = tool_choice
 
-        # 创建 OpenAI 客户端
-        client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+                stream = _client.chat.completions.create(**kwargs)
+                for chunk in stream:
+                    if stop_event.is_set():
+                        stream.close()
+                        return
+                    chunk_queue.put(("chunk", chunk))
+                chunk_queue.put(("done", None))
+            except Exception as e:
+                chunk_queue.put(("error", e))
 
-        # 构建请求参数
-        kwargs = {
-            "model": effective_model,
-            "messages": messages,
-            "stream": True,
-        }
-        if tools:
-            kwargs["tools"] = tools
-            if tool_choice != "auto":
-                kwargs["tool_choice"] = tool_choice
+        # ---- 心跳线程 ----
+        def ping_worker():
+            while not stop_event.is_set():
+                if stop_event.wait(KEEPALIVE_INTERVAL):
+                    return
+                try:
+                    chunk_queue.put(("ping", None), timeout=1)
+                except queue.Full:
+                    pass
 
-        # 状态跟踪
-        text_item_id = f"item_{uuid.uuid4().hex[:12]}"
-        full_text = ""
-        has_text = False
-        text_started = False
-        tool_calls_acc = {}
-        input_tokens = 0
-        output_tokens = 0
-        seq = 0
+        # ---- 主处理逻辑 ----
+        def process_upstream():
+            text_item_id = f"item_{uuid.uuid4().hex[:12]}"
+            full_text = ""
+            has_text = False
+            text_started = False
+            tool_calls_acc = {}
+            input_tokens = 0
+            output_tokens = 0
+            seq = 0
+            stream_done = False
 
-        try:
-            stream = client.chat.completions.create(**kwargs)
+            t_up = threading.Thread(target=upstream_worker, daemon=True)
+            t_ping = threading.Thread(target=ping_worker, daemon=True)
+            t_up.start()
+            t_ping.start()
 
-            for chunk in stream:
-                if chunk.usage:
-                    input_tokens = chunk.usage.prompt_tokens or 0
-                    output_tokens = chunk.usage.completion_tokens or 0
+            try:
+                while not stream_done:
+                    try:
+                        msg_type, data = chunk_queue.get(timeout=60)
+                    except queue.Empty:
+                        yield _make_ping()
+                        continue
 
-                choice = chunk.choices[0] if chunk.choices else None
-                if not choice:
-                    continue
+                    if msg_type == "ping":
+                        yield _make_ping()
+                        continue
 
-                delta = choice.delta
+                    if msg_type == "done":
+                        stream_done = True
+                        break
 
-                # 处理文本内容
-                if delta.content:
-                    if not text_started:
-                        text_started = True
-                        has_text = True
-                        yield from _emit_text_start(text_item_id)
+                    if msg_type == "error":
+                        raise data
 
-                    full_text += delta.content
-                    seq += 1
-                    yield _format_sse("response.output_text.delta", {
-                        "type": "response.output_text.delta",
-                        "delta": delta.content,
-                        "item_id": text_item_id,
-                        "output_index": 0, "content_index": 0,
-                        "sequence_number": seq,
-                    })
+                    # msg_type == "chunk"
+                    chunk = data
 
-                # 处理工具调用
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        idx = tc.index
-                        if idx not in tool_calls_acc:
-                            tool_calls_acc[idx] = {
-                                "id": tc.id or "",
-                                "name": "",
-                                "arguments": "",
-                                "item_id": f"item_{uuid.uuid4().hex[:12]}",
-                                "started": False,
-                            }
+                    if chunk.usage:
+                        input_tokens = chunk.usage.prompt_tokens or 0
+                        output_tokens = chunk.usage.completion_tokens or 0
 
-                        acc = tool_calls_acc[idx]
-                        if tc.function and tc.function.name:
-                            acc["name"] = tc.function.name
-                        if tc.id:
-                            acc["id"] = tc.id
-                        if tc.function and tc.function.arguments:
-                            acc["arguments"] += tc.function.arguments
-                            out_idx = (1 if has_text else 0) + sorted(tool_calls_acc.keys()).index(idx)
+                    choice = chunk.choices[0] if chunk.choices else None
+                    if not choice:
+                        continue
 
-                            if not acc["started"]:
-                                acc["started"] = True
-                                yield _format_sse("response.output_item.added", {
-                                    "type": "response.output_item.added",
+                    delta = choice.delta
+
+                    if delta.content:
+                        if not text_started:
+                            text_started = True
+                            has_text = True
+                            for evt in _emit_text_start(text_item_id):
+                                yield evt
+                        full_text += delta.content
+                        seq += 1
+                        yield _format_sse("response.output_text.delta", {
+                            "type": "response.output_text.delta",
+                            "delta": delta.content,
+                            "item_id": text_item_id,
+                            "output_index": 0, "content_index": 0,
+                            "sequence_number": seq,
+                        })
+
+                    if delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            idx = tc.index
+                            if idx not in tool_calls_acc:
+                                tool_calls_acc[idx] = {
+                                    "id": tc.id or "",
+                                    "name": "",
+                                    "arguments": "",
+                                    "item_id": f"item_{uuid.uuid4().hex[:12]}",
+                                    "started": False,
+                                }
+                            acc = tool_calls_acc[idx]
+                            if tc.function and tc.function.name:
+                                acc["name"] = tc.function.name
+                            if tc.id:
+                                acc["id"] = tc.id
+                            if tc.function and tc.function.arguments:
+                                acc["arguments"] += tc.function.arguments
+                                out_idx = (1 if has_text else 0) + sorted(tool_calls_acc.keys()).index(idx)
+                                if not acc["started"]:
+                                    acc["started"] = True
+                                    yield _format_sse("response.output_item.added", {
+                                        "type": "response.output_item.added",
+                                        "output_index": out_idx,
+                                        "item": {
+                                            "id": acc["item_id"],
+                                            "type": "function_call",
+                                            "status": "in_progress",
+                                            "call_id": acc["id"],
+                                            "name": acc["name"],
+                                            "arguments": "",
+                                        },
+                                    })
+                                yield _format_sse("response.function_call_arguments.delta", {
+                                    "type": "response.function_call_arguments.delta",
+                                    "item_id": acc["item_id"],
                                     "output_index": out_idx,
-                                    "item": {
-                                        "id": acc["item_id"],
-                                        "type": "function_call",
-                                        "status": "in_progress",
-                                        "call_id": acc["id"],
-                                        "name": acc["name"],
-                                        "arguments": "",
-                                    },
+                                    "delta": tc.function.arguments,
                                 })
 
-                            yield _format_sse("response.function_call_arguments.delta", {
-                                "type": "response.function_call_arguments.delta",
-                                "item_id": acc["item_id"],
-                                "output_index": out_idx,
-                                "delta": tc.function.arguments,
-                            })
+                # ---- 流结束，输出最终事件 ----
+                output_items = []
+                if has_text:
+                    for evt in _emit_text_events(text_item_id, full_text):
+                        yield evt
+                    output_item_text = _emit_text_done(text_item_id, full_text)
+                    output_items.append(output_item_text)
+                    yield _format_sse("response.output_item.done", {
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": output_item_text,
+                    })
 
-            # 完成文本输出
-            output_items = []
-            if has_text:
-                yield from _emit_text_events(text_item_id, full_text)
-                output_item_text = _emit_text_done(text_item_id, full_text)
-                output_items.append(output_item_text)
-                yield _format_sse("response.output_item.done", {
-                    "type": "response.output_item.done",
-                    "output_index": 0,
-                    "item": output_item_text,
-                })
+                for idx in sorted(tool_calls_acc.keys()):
+                    acc = tool_calls_acc[idx]
+                    out_idx = (1 if has_text else 0) + sorted(tool_calls_acc.keys()).index(idx)
+                    for evt in _emit_tool_call_events(acc, out_idx):
+                        yield evt
+                    func_item = _emit_tool_call_done(acc, out_idx)
+                    output_items.append(func_item)
+                    yield _format_sse("response.output_item.done", {
+                        "type": "response.output_item.done",
+                        "output_index": out_idx,
+                        "item": func_item,
+                    })
 
-            # 完成工具调用输出
-            for idx in sorted(tool_calls_acc.keys()):
-                acc = tool_calls_acc[idx]
-                out_idx = (1 if has_text else 0) + sorted(tool_calls_acc.keys()).index(idx)
-                yield from _emit_tool_call_events(acc, out_idx)
-                func_item = _emit_tool_call_done(acc, out_idx)
-                output_items.append(func_item)
-                yield _format_sse("response.output_item.done", {
-                    "type": "response.output_item.done",
-                    "output_index": out_idx,
-                    "item": func_item,
-                })
-
-            # 发送完成事件
-            yield _format_sse("response.completed", {
-                "type": "response.completed",
-                "response": {
-                    "id": response_id, "object": "response",
-                    "status": "completed", "model": effective_model,
-                    "output": output_items,
-                    "usage": {
-                        "input_tokens": input_tokens or _estimate_tokens(json.dumps(messages)),
-                        "output_tokens": output_tokens or _estimate_tokens(full_text),
-                        "total_tokens": (input_tokens or _estimate_tokens(json.dumps(messages)))
-                                        + (output_tokens or _estimate_tokens(full_text)),
+                yield _format_sse("response.completed", {
+                    "type": "response.completed",
+                    "response": {
+                        "id": response_id, "object": "response",
+                        "status": "completed", "model": effective_model,
+                        "output": output_items,
+                        "usage": {
+                            "input_tokens": input_tokens or _estimate_tokens(json.dumps(messages)),
+                            "output_tokens": output_tokens or _estimate_tokens(full_text),
+                            "total_tokens": (input_tokens or _estimate_tokens(json.dumps(messages)))
+                                            + (output_tokens or _estimate_tokens(full_text)),
+                        },
                     },
-                },
-            })
+                })
 
-        except Exception as e:
-            err_msg = f" API error: {type(e).__name__}: {e}"
-            logger.error(err_msg)
-            yield _format_sse("response.failed", {
-                "type": "response.failed",
+            finally:
+                stop_event.set()
+
+        # ---- 入口 ----
+        try:
+            if not messages:
+                yield _format_sse("response.completed", {
+                    "type": "response.completed",
+                    "response": {
+                        "id": response_id, "object": "response",
+                        "status": "completed", "model": effective_model,
+                        "output": [], "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                    },
+                })
+                return
+
+            yield _format_sse("response.created", {
+                "type": "response.created",
                 "response": {
                     "id": response_id, "object": "response",
-                    "status": "failed", "model": effective_model,
-                    "error": {"message": err_msg, "type": "upstream_error"},
+                    "status": "in_progress", "model": effective_model,
                     "output": [], "usage": None,
                 },
             })
+            yield _format_sse("response.in_progress", {
+                "type": "response.in_progress",
+                "response": {
+                    "id": response_id, "object": "response",
+                    "status": "in_progress", "model": effective_model,
+                    "output": [], "usage": None,
+                },
+            })
+
+            yield from process_upstream()
+
+        except GeneratorExit:
+            logger.info("客户端断开连接，生成器退出")
+        except Exception as e:
+            err_msg = f"API error: {type(e).__name__}: {e}"
+            logger.exception(err_msg)
+            try:
+                yield _format_sse("response.failed", {
+                    "type": "response.failed",
+                    "response": {
+                        "id": response_id, "object": "response",
+                        "status": "failed", "model": effective_model,
+                        "error": {"message": err_msg, "type": "upstream_error"},
+                        "output": [], "usage": None,
+                    },
+                })
+            except GeneratorExit:
+                pass
 
     return Response(
         generate(),
@@ -465,6 +550,11 @@ def _make_response():
 def _format_sse(event_name, data):
     """格式化 SSE 事件"""
     return f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _make_ping():
+    """发送心跳保持连接"""
+    return ": keepalive\n\n"
 
 
 def _emit_text_start(text_item_id):
@@ -543,13 +633,6 @@ app.add_url_rule("/v1/chat/completions", "v1_chat", _make_response, methods=["PO
 if __name__ == "__main__":
     from waitress import serve
 
-    print("=" * 60)
-    print(" Codex Proxy 启动中...")
-    print("=" * 60)
-    print(f"  Endpoint: http://{HOST}:{PORT}")
-    print(f"  Model:    {MODEL}")
-    print(f"  Debug:    {'开启' if DEBUG else '关闭'}")
-    print(f"  Routes:   /responses, /v1/responses, /v1/chat/completions")
-    print("=" * 60)
+    logger.info(f"Proxy started \u2192 http://{HOST}:{PORT} | model={MODEL} | debug={DEBUG} | threads={THREADS}")
 
     serve(app, host=HOST, port=PORT, threads=THREADS)
